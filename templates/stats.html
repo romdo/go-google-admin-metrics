@@ -22,7 +22,7 @@
             <span class="text-red-500">{{.UsedQuota}} TB</span>
         </div>
         <div class="flex items-center mt-2 mb-2">
-            <div class="h-2 rounded-full flex-grow mr-2">
+            <div class="h-2 bg-gray-700 rounded-full flex-grow mr-2">
                 <div class="h-full bg-blue-600 rounded-full" style="width:{{printf "%.2f" .PercentageUsed}}%;"></div>
             </div>
             <span class="text-green-500">{{printf "%.2f" .PercentageUsed}}%</span>
