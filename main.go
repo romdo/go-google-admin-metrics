@@ -5,20 +5,92 @@ import (
 	"encoding/json"
 	"fmt"
 	"html/template"
-	"io/ioutil"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
+	"strconv"
+	"time"
 
 	_ "embed"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	admin "google.golang.org/api/admin/reports/v1"
+	"google.golang.org/api/option"
 )
 
 //go:embed templates/stats.html
 var statsTemplate string
+
+type QuotaCollector struct {
+	total  *prometheus.Desc
+	used   *prometheus.Desc
+	client *admin.Service
+}
+
+func NewQuotaCollector(client *admin.Service) *QuotaCollector {
+	return &QuotaCollector{
+		total: prometheus.NewDesc("google_workspace_quota_bytes_total",
+			"Total quota in bytes",
+			nil, nil,
+		),
+		used: prometheus.NewDesc("google_workspace_quota_bytes_used",
+			"Used quota in bytes",
+			nil, nil,
+		),
+		client: client,
+	}
+}
+
+func (c *QuotaCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.total
+	ch <- c.used
+}
+
+func (c *QuotaCollector) Collect(ch chan<- prometheus.Metric) {
+	totalQuota, usedQuota, _, err := c.fetchQuotaStats()
+	if err != nil {
+		slog.Error(
+			"Failed to fetch quota stats",
+			slog.String("err", err.Error()),
+		)
+		return
+	}
+
+	ch <- prometheus.MustNewConstMetric(
+		c.total, prometheus.GaugeValue, totalQuota*1048576,
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.used, prometheus.GaugeValue, usedQuota*1048576,
+	)
+}
+
+func (c *QuotaCollector) fetchQuotaStats() (float64, float64, float64, error) {
+	fourteenDaysAgo := time.Now().AddDate(0, 0, -14).Format("2006-01-02")
+	resp, err := c.client.CustomerUsageReports.Get(fourteenDaysAgo).Do()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+
+	var totalQuota float64
+	var usedQuota float64
+
+	for _, param := range resp.UsageReports[0].Parameters {
+		switch param.Name {
+		case "accounts:total_quota_in_mb":
+			totalQuota = float64(param.IntValue)
+		case "accounts:used_quota_in_mb":
+			usedQuota = float64(param.IntValue)
+		}
+	}
+
+	percentageUsed := (usedQuota / totalQuota) * 100
+
+	return totalQuota, usedQuota, percentageUsed, nil
+}
 
 func getClient(config *oauth2.Config) *http.Client {
 	tokenFile := "token.json"
@@ -59,12 +131,12 @@ func getTokenFromWeb(config *oauth2.Config) *oauth2.Token {
 
 func saveToken(file string, token *oauth2.Token) {
 	fmt.Printf("Saving credential file to: %s\n", file)
-	f, err := os.OpenFile(file, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+	f, err := os.OpenFile(file, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		log.Fatalf("Unable to cache oauth token: %v", err)
 	}
 	defer f.Close()
-	json.NewEncoder(f).Encode(token)
+	_ = json.NewEncoder(f).Encode(token)
 }
 
 type QuotaStats struct {
@@ -73,71 +145,94 @@ type QuotaStats struct {
 	PercentageUsed float64 // in percentage
 }
 
+func statsPageHanderFunc(collector *QuotaCollector) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		total, used, percentage, err := collector.fetchQuotaStats()
+		if err != nil {
+			slog.Error(
+				"Failed to fetch quota stats",
+				slog.String("err", err.Error()),
+			)
+			http.Error(
+				w, "Failed to fetch quota stats",
+				http.StatusInternalServerError,
+			)
+			return
+		}
+
+		stats := QuotaStats{
+			TotalQuota:     strconv.FormatFloat(total/1048576, 'f', 3, 64),
+			UsedQuota:      strconv.FormatFloat(used/1048576, 'f', 3, 64),
+			PercentageUsed: percentage,
+		}
+		renderStatsPage(w, stats)
+	}
+}
+
 func renderStatsPage(w http.ResponseWriter, stats QuotaStats) {
 	tmpl, err := template.New("stats").Parse(statsTemplate)
 	if err != nil {
-		http.Error(w, "Failed to parse template", http.StatusInternalServerError)
+		http.Error(
+			w, "Failed to parse template", http.StatusInternalServerError,
+		)
 		return
 	}
 
 	err = tmpl.Execute(w, stats)
 	if err != nil {
-		http.Error(w, "Failed to render template", http.StatusInternalServerError)
+		http.Error(
+			w, "Failed to render template", http.StatusInternalServerError,
+		)
 		return
 	}
 }
 
 func main() {
-	b, err := ioutil.ReadFile("credentials.json")
+	b, err := os.ReadFile("credentials.json")
 	if err != nil {
 		log.Fatalf("Unable to read client secret file: %v", err)
 	}
 
-	config, err := google.ConfigFromJSON(b, "https://www.googleapis.com/auth/admin.reports.usage.readonly")
+	config, err := google.ConfigFromJSON(
+		b,
+		"https://www.googleapis.com/auth/admin.reports.usage.readonly",
+	)
 	if err != nil {
 		log.Fatalf("Unable to parse client secret file to config: %v", err)
 	}
 
 	client := getClient(config)
-	srv, err := admin.New(client)
+	srv, err := admin.NewService(
+		context.Background(), option.WithHTTPClient(client),
+	)
 	if err != nil {
 		log.Fatalf("Unable to retrieve reports Client %v", err)
 	}
 
-	getQuotaStats := func() (string, string, float64) {
-		resp, err := srv.CustomerUsageReports.Get("2023-10-10").Do() // Replace with the appropriate date
-		if err != nil {
-			log.Fatalf("Unable to get report: %v", err)
+	collector := NewQuotaCollector(srv)
+	prometheus.MustRegister(collector)
+
+	http.HandleFunc("/", statsPageHanderFunc(collector))
+	http.Handle("/metrics", promhttp.Handler())
+
+	port := "8080"
+	if v := os.Getenv("PORT"); v != "" {
+		if _, e := strconv.Atoi(v); e != nil {
+			slog.Error(
+				"Failed to parse PORT env var",
+				slog.String("err", err.Error()),
+			)
+		} else {
+			port = v
 		}
-
-		totalQuota := 0
-		usedQuota := 0
-
-		for _, param := range resp.UsageReports[0].Parameters {
-			switch param.Name {
-			case "accounts:total_quota_in_mb":
-				totalQuota = int(param.IntValue)
-			case "accounts:used_quota_in_mb":
-				usedQuota = int(param.IntValue)
-			}
-		}
-
-		totalQuotaTB := float64(totalQuota) / 1048576
-		usedQuotaTB := float64(usedQuota) / 1048576
-		percentageUsed := (usedQuotaTB / totalQuotaTB) * 100
-
-		return fmt.Sprintf("%.3f", totalQuotaTB), fmt.Sprintf("%.3f", usedQuotaTB), percentageUsed
 	}
 
-	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		totalQuota, usedQuota, percentageUsed := getQuotaStats()
-		stats := QuotaStats{
-			TotalQuota:     totalQuota,
-			UsedQuota:      usedQuota,
-			PercentageUsed: percentageUsed,
-		}
-		renderStatsPage(w, stats)
-	})
-
-	http.ListenAndServe(":8080", nil)
+	err = http.ListenAndServe(":"+port, nil)
+	if err != nil {
+		slog.Error(
+			"Failed to start http server",
+			slog.String("err", err.Error()),
+		)
+		os.Exit(1)
+	}
 }
