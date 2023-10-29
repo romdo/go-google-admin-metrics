@@ -26,13 +26,18 @@ import (
 var statsTemplate string
 
 type QuotaCollector struct {
-	total  *prometheus.Desc
-	used   *prometheus.Desc
-	client *admin.Service
+	timestamp *prometheus.Desc
+	total     *prometheus.Desc
+	used      *prometheus.Desc
+	client    *admin.Service
 }
 
 func NewQuotaCollector(client *admin.Service) *QuotaCollector {
 	return &QuotaCollector{
+		timestamp: prometheus.NewDesc("google_workspace_quota_timestamp",
+			"Timestamp of the quota stats",
+			nil, nil,
+		),
 		total: prometheus.NewDesc("google_workspace_quota_bytes_total",
 			"Total quota in bytes",
 			nil, nil,
@@ -51,7 +56,7 @@ func (c *QuotaCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *QuotaCollector) Collect(ch chan<- prometheus.Metric) {
-	_, totalQuota, usedQuota, _, err := c.fetchQuotaStats()
+	t, totalQuota, usedQuota, _, err := c.fetchQuotaStats()
 	if err != nil {
 		slog.Error(
 			"Failed to fetch quota stats",
@@ -60,6 +65,9 @@ func (c *QuotaCollector) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 
+	ch <- prometheus.MustNewConstMetric(
+		c.timestamp, prometheus.GaugeValue, float64(t.Unix()),
+	)
 	ch <- prometheus.MustNewConstMetric(
 		c.total, prometheus.GaugeValue, totalQuota*1048576,
 	)
