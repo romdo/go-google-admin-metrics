@@ -51,7 +51,7 @@ func (c *QuotaCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *QuotaCollector) Collect(ch chan<- prometheus.Metric) {
-	totalQuota, usedQuota, _, err := c.fetchQuotaStats()
+	_, totalQuota, usedQuota, _, err := c.fetchQuotaStats()
 	if err != nil {
 		slog.Error(
 			"Failed to fetch quota stats",
@@ -68,11 +68,23 @@ func (c *QuotaCollector) Collect(ch chan<- prometheus.Metric) {
 	)
 }
 
-func (c *QuotaCollector) fetchQuotaStats() (float64, float64, float64, error) {
-	fourteenDaysAgo := time.Now().AddDate(0, 0, -14).Format("2006-01-02")
-	resp, err := c.client.CustomerUsageReports.Get(fourteenDaysAgo).Do()
+func (c *QuotaCollector) fetchQuotaStats() (
+	time.Time, float64, float64, float64, error,
+) {
+	var t time.Time
+	var resp *admin.UsageReports
+	var err error
+
+	for i := -1; i > -6; i-- {
+		t = time.Now().AddDate(0, 0, i).UTC().Truncate(24 * time.Hour)
+		date := t.Format("2006-01-02")
+		resp, err = c.client.CustomerUsageReports.Get(date).Do()
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
-		return 0, 0, 0, err
+		return time.Time{}, 0, 0, 0, err
 	}
 
 	var totalQuota float64
@@ -89,7 +101,7 @@ func (c *QuotaCollector) fetchQuotaStats() (float64, float64, float64, error) {
 
 	percentageUsed := (usedQuota / totalQuota) * 100
 
-	return totalQuota, usedQuota, percentageUsed, nil
+	return t, totalQuota, usedQuota, percentageUsed, nil
 }
 
 func getClient(config *oauth2.Config) *http.Client {
@@ -140,6 +152,7 @@ func saveToken(file string, token *oauth2.Token) {
 }
 
 type QuotaStats struct {
+	Date           string  // in YYYY-MM-DD
 	TotalQuota     string  // in TB
 	UsedQuota      string  // in TB
 	PercentageUsed float64 // in percentage
@@ -147,7 +160,7 @@ type QuotaStats struct {
 
 func statsPageHanderFunc(collector *QuotaCollector) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
-		total, used, percentage, err := collector.fetchQuotaStats()
+		t, total, used, percentage, err := collector.fetchQuotaStats()
 		if err != nil {
 			slog.Error(
 				"Failed to fetch quota stats",
@@ -161,6 +174,7 @@ func statsPageHanderFunc(collector *QuotaCollector) http.HandlerFunc {
 		}
 
 		stats := QuotaStats{
+			Date:           t.Format("2006-01-02"),
 			TotalQuota:     strconv.FormatFloat(total/1048576, 'f', 3, 64),
 			UsedQuota:      strconv.FormatFloat(used/1048576, 'f', 3, 64),
 			PercentageUsed: percentage,
