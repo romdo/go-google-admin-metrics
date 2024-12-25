@@ -1,5 +1,5 @@
 # Use the official Go image as the base image
-FROM golang:1.21 AS builder
+FROM golang:1.23 AS builder
 
 # Set the working directory inside the container
 WORKDIR /app
@@ -12,16 +12,17 @@ RUN go mod download
 COPY . .
 
 # Build the Go application for a smaller and more secure container
-RUN CGO_ENABLED=0 GOOS=linux go build -o google-disk-space-cli
+RUN CGO_ENABLED=0 go build -o google-disk-space-cli
 
 # Use a small base image for the release stage
-FROM alpine:3.14
-
-# Set the working directory inside the container
-WORKDIR /
+FROM alpine:3.21
 
 # Copy the binary from the builder stage
 COPY --from=builder /app/google-disk-space-cli /
+
+# Set the working directory inside the container
+VOLUME /config
+WORKDIR /config
 
 # Command to run the application
 CMD ["/google-disk-space-cli"]
