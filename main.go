@@ -241,7 +241,6 @@ func renderStatsPage(w http.ResponseWriter, stats QuotaStats) {
 func authTokenMiddleware(authToken string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			slog.Info("authTokenMiddleware")
 			if authToken != "" && r.URL.Query().Get("token") != authToken {
 				http.Error(w, "Unauthorized", http.StatusUnauthorized)
 				return
